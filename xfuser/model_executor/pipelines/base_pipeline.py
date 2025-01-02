@@ -9,7 +9,6 @@ import torch.nn as nn
 
 from diffusers import DiffusionPipeline
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
-
 from distvae.modules.adapters.vae.decoder_adapters import DecoderAdapter
 from xfuser.core.distributed.group_coordinator import GroupCoordinator
 from xfuser.config.config import (
@@ -65,10 +64,11 @@ logger = init_logger(__name__)
 class xFuserVAEWrapper:
     def __init__(
         self, 
-        vae: AutoencoderKL, 
+        vae,
         engine_config: EngineConfig,
         dit_parallel_config: ParallelConfig,
-        use_parallel: bool = False
+        use_parallel: bool = False,
+        image_processor = None,
     ):
         self.vae = self._convert_vae(vae) if use_parallel else vae
         self.engine_config = engine_config
@@ -90,22 +90,13 @@ class xFuserVAEWrapper:
             # 计算 dp_last_group 中的 rank
             self.dit_last_rank = sp_last * (dit_parallel_config.cfg_degree * dit_parallel_config.pp_degree) + \
                     cfg_last * dit_parallel_config.pp_degree + pp_last
+            self.image_processor = image_processor
 
     def _convert_vae(self, vae: AutoencoderKL):
         """Convert VAE to parallel version"""
         logger.info("VAE found, paralleling vae...")
         vae.decoder = DecoderAdapter(vae.decoder, vae_group=get_vae_parallel_group())
         return vae
-    
-    def decode(self, latents: torch.Tensor, **kwargs):
-        return self.vae.decode(latents, **kwargs)
-    
-    def encode(self, images: torch.Tensor, **kwargs):
-        return self.vae.encode(images, **kwargs)
-    
-    def to(self, *args, **kwargs):
-        self.vae = self.vae.to(*args, **kwargs)
-        return self
     
     def reset_activation_cache(self):
         if hasattr(self.vae, "reset_activation_cache"):
@@ -148,9 +139,17 @@ class xFuserVAEWrapper:
                 print(f"receive shape tensor done, rank: {get_world_group().rank}")
                 latents = torch.zeros(torch.Size(shape_tensor), dtype=dtype, device=device)
                 torch.distributed.broadcast(latents, src=dit_world_size, group=get_vae_parallel_group())
+            # 确保 VAE 处于评估模式
+            self.vae.eval()
             
+            with torch.no_grad():  # 显式禁用梯度计算
+                # 确保 latents 不需要梯度
+                latents = latents.detach()
+                # 缩放 latents
+                if hasattr(self.vae, 'config'):
+                    latents = latents / self.vae.config.scaling_factor
             print(f"vae decode begin, rank: {get_world_group().rank}")
-            print("latents.shape", latents.shape)
+            print(f"Sending latents with shape: {latents.shape}, dtype: {latents.dtype}, device: {latents.device}, requires_grad: {latents.requires_grad}")
             image = self.vae.decode(latents, return_dict=False)[0]
             print(f"vae decode done, rank: {get_world_group().rank}")
             image = self.image_processor.postprocess(image, output_type=output_type)

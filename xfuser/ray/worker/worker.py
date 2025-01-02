@@ -11,6 +11,7 @@ from xfuser.model_executor.pipelines.base_pipeline import xFuserVAEWrapper
 from xfuser.core.distributed.parallel_state import initialize_model_parallel
 import datetime
 from diffusers import FluxPipeline
+
 class WorkerBase(ABC):
     def __init__(
         self,
@@ -119,36 +120,23 @@ class VAEWorker(WorkerBase):
         **kwargs
     ):
         local_rank = get_world_group().local_rank
+        for key, value in dict(kwargs).items():
+            if isinstance(value, dict) and 'model_class' in value:
+                encoder_config = kwargs.pop(key)
+                encoder_class = encoder_config.pop('model_class') 
+                encoder_instance = encoder_class.from_pretrained(**encoder_config)
+                kwargs[key] = encoder_instance
         
-        # Initialize VAE not working
-        # from diffusers import AutoencoderKL
-        # vae = AutoencoderKL.from_pretrained(
-        #     pretrained_model_name_or_path,
-        #     subfolder="vae",
-        #     **kwargs
-        # ).to(f"cuda:{local_rank}")
         pipe = FluxPipeline.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        print(f"Pre-device pipeline type: {type(pipe)}")
-        print(f"Pre-device VAE type: {type(pipe.vae)}")
-        print(f"Pre-device VAE id: {id(pipe.vae)}")
-        print(f"Pre-device VAE device: {next(pipe.vae.parameters()).device}")
         
-        pipe = pipe.to(f"cuda:{local_rank}")
-        print(f"Post-device pipeline type: {type(pipe)}")
-        print(f"Post-device VAE type: {type(pipe.vae)}")
-        print(f"Post-device VAE id: {id(pipe.vae)}")
-        print(f"Post-device VAE device: {next(pipe.vae.parameters()).device}")
+        vae = getattr(pipe, "vae", None).to(f"cuda:{local_rank}")
         
-        vae = getattr(pipe, "vae", None)
-        print(f"Extracted VAE type: {type(vae)}")
-        print(f"Extracted VAE id: {id(vae)}")
-        print(f"Extracted VAE device: {next(vae.parameters()).device}")
-        print("=== VAEWorker.from_pretrained END ===\n")
         self.vae = xFuserVAEWrapper(
             vae,
             engine_config=engine_config,
             dit_parallel_config=self.parallel_config,
-            use_parallel=engine_config.runtime_config.use_parallel_vae
+            use_parallel=engine_config.runtime_config.use_parallel_vae,
+            image_processor=pipe.image_processor
         )
         return
     

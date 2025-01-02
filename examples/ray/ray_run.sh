@@ -29,9 +29,9 @@ mkdir -p ./results
 TASK_ARGS="--height 1024 --width 1024 --no_use_resolution_binning"
 
 
-N_GPUS=2 # FIXME: only for dit0
+N_GPUS=3 # FIXME: only for dit0
 PARALLEL_ARGS="--pipefusion_parallel_degree 2 --ulysses_degree 1 --ring_degree 1"
-VAE_PARALLEL_SIZE=0
+VAE_PARALLEL_SIZE=1
 # CFG_ARGS="--use_cfg_parallel"
 
 # By default, num_pipeline_patch = pipefusion_degree, and you can tune this parameter to achieve optimal performance.
