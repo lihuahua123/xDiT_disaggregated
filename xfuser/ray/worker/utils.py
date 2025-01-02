@@ -29,3 +29,4 @@ def update_environment_variables(envs: Dict[str, str]):
                 v,
             )
         os.environ[k] = v
+        

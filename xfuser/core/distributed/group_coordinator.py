@@ -119,6 +119,7 @@ class GroupCoordinator:
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            print(f"group_ranks: {ranks}, self.rank: {self.rank}, self.local_rank: {self.local_rank}")
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -134,6 +135,11 @@ class GroupCoordinator:
         else:
             self.device = torch.device("cpu")
 
+    @property
+    def size(self):
+        """Return the size of the process group (alias for world_size)"""
+        return self.world_size
+    
     @property
     def first_rank(self):
         """Return the global rank of the first process in the group"""

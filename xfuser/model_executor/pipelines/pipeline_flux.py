@@ -33,7 +33,11 @@ from xfuser.core.distributed import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
     is_dp_last_group,
+    get_world_group,
+    get_vae_parallel_group,
+    get_dit_world_size,
 )
+from xfuser.core.distributed.group_coordinator import GroupCoordinator
 from .base_pipeline import xFuserPipelineBaseWrapper
 from .register import xFuserPipelineWrapperRegister
 
@@ -56,7 +60,9 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         **kwargs,
     ):
         pipeline = FluxPipeline.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        return cls(pipeline, engine_config)
+        pipeline = cls(pipeline, engine_config)
+        pipeline.engine_config = engine_config
+        return pipeline
 
     def prepare_run(
         self,
@@ -344,7 +350,8 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                     callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
                     sync_only=True,
                 )
-
+                
+        image = None
         def vae_decode(latents):
             latents = self._unpack_latents(
                 latents, height, width, self.vae_scale_factor
@@ -352,23 +359,34 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             latents = (
                 latents / self.vae.config.scaling_factor
             ) + self.vae.config.shift_factor
-
             image = self.vae.decode(latents, return_dict=False)[0]
             return image
-
         if not output_type == "latent":
-            if get_runtime_state().runtime_config.use_parallel_vae:
-                latents = self.gather_broadcast_latents(latents)
-                image = vae_decode(latents)
+            if get_runtime_state().runtime_config.use_parallel_vae and get_runtime_state().parallel_config.vae_parallel_size > 0:
+                latents = self.gather_latents(latents)
+                if latents is not None:
+                    latents = self._unpack_latents(
+                        latents, height, width, self.vae_scale_factor
+                    )
+                    latents = (
+                        latents / self.vae.config.scaling_factor
+                    ) + self.vae.config.shift_factor
+                    print("latents.shape", latents.shape)
+                    print(f"dit go to vae_decode!!, rank: {get_world_group().rank}")
+                image = self.vae_decode(latents) 
             else:
-                if is_dp_last_group():
+                if get_runtime_state().runtime_config.use_parallel_vae:
+                    latents = self.gather_broadcast_latents(latents)
                     image = vae_decode(latents)
+                else:
+                    if is_dp_last_group():
+                        image = vae_decode(latents)
 
         if self.is_dp_last_group():
             if output_type == "latent":
                 image = latents
 
-            else:
+            elif image is not None:
                 image = self.image_processor.postprocess(image, output_type=output_type)
 
             # Offload all models
@@ -380,7 +398,27 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             return FluxPipelineOutput(images=image)
         else:
             return None
+    
+    def vae_decode(self, latents):
+        print(f"vae_decode, rank: {get_world_group().rank},{get_runtime_state().runtime_config.use_parallel_vae},{is_dp_last_group()}")
+        if get_runtime_state().runtime_config.use_parallel_vae and get_runtime_state().parallel_config.vae_parallel_size > 0:
+            device = self._execution_device
+            if is_dp_last_group(): 
+                # Get first VAE rank
+                vae_first_rank = get_dit_world_size()  # VAE ranks start after DiT ranks
+                print(f"vae_first_rank: {vae_first_rank},begin to send shape info and latents")
+                # Send shape info and latents to first VAE rank
+                shape_len = torch.tensor([len(latents.shape)], dtype=torch.int, device=device)
+                torch.distributed.send(shape_len, dst=vae_first_rank)
+                print(f"send shape len done, rank: {get_world_group().rank}")
+                shape_tensor = torch.tensor(latents.shape, dtype=torch.int, device=device)
+                torch.distributed.send(shape_tensor, dst=vae_first_rank)
+                print(f"send shape tensor done, rank: {get_world_group().rank}")
+                torch.distributed.send(latents, dst=vae_first_rank)
+                print(f"send latents done, rank: {get_world_group().rank}")
+            return None
 
+    
     def _init_sync_pipeline(
         self, latents: torch.Tensor, latent_image_ids: torch.Tensor, 
         prompt_embeds: torch.Tensor, text_ids: torch.Tensor
